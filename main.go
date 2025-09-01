@@ -31,8 +31,8 @@ func NewExifTool(numWorkers int) (*ExifTool, error) {
 	return nil, nil
 }
 
-func (exifTool *ExifTool) FetchExif(filePath string) (Exif, error) {
-	return Exif{}, nil
+func (exifTool *ExifTool) FetchExif(filePaths []string) ([]Exif, error) {
+	return []Exif{}, nil
 }
 
 func (exifTool *ExifTool) Close() error {
