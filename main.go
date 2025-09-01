@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sync"
 	"time"
 )
 
@@ -17,6 +18,40 @@ import (
 // TODO: use this instead https://pkg.go.dev/github.com/ncruces/go-exiftool#Server
 
 var timestampFilenamePattern = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}\.\d{2}\.\d{2}((?i)\.jpg|jpeg|png)`)
+
+type ExifTool struct {
+	waitGroup sync.WaitGroup
+	tasks     chan Task
+}
+
+func NewExifTool(numWorkers int) (*ExifTool, error) {
+	if numWorkers < 1 {
+		return nil, fmt.Errorf("numWorkers must at least be 1")
+	}
+	return nil, nil
+}
+
+func (exifTool *ExifTool) FetchExif(filePath string) (Exif, error) {
+	return Exif{}, nil
+}
+
+func (exifTool *ExifTool) Close() error {
+	// TODO: util_unix.go, util_windows.go: setpgid(cmd), stop(cmd)
+	exifTool.waitGroup.Wait()
+	return nil
+}
+
+type Task struct {
+	done     chan struct{}
+	metadata Exif
+}
+
+type Exif struct {
+	FilePath   string
+	FileSize   string
+	CreateDate string
+	OffsetTime string
+}
 
 func main() {
 	err := func() error {
