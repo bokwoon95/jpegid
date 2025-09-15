@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"io/fs"
 	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -35,17 +39,19 @@ func main() {
 		<-userInterrupt // Hard interrupt.
 		os.Exit(1)
 	}()
-	jpegIDCmd, err := JpegIDCommand(ctx, os.Args)
+	jpegIDCmd, err := JpegIDCommand(os.Args)
 	if err != nil {
 		if errors.Is(err, flag.ErrHelp) {
 			return
 		}
 		log.Fatal(err)
 	}
-	err = jpegIDCmd.Run()
+	err = jpegIDCmd.Run(ctx)
 	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		if !errors.Is(err, context.Canceled) {
+			fmt.Println(err)
+			os.Exit(1)
+		}
 	}
 }
 
@@ -78,10 +84,10 @@ type JpegIDCmd struct {
 	ExitOnError bool
 	Stdout      io.Writer
 	Stderr      io.Writer
-	ctx         context.Context
+	logger      *slog.Logger
 }
 
-func JpegIDCommand(ctx context.Context, args []string) (*JpegIDCmd, error) {
+func JpegIDCommand(args []string) (*JpegIDCmd, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
 		return nil, err
@@ -90,7 +96,6 @@ func JpegIDCommand(ctx context.Context, args []string) (*JpegIDCmd, error) {
 		Roots:  []string{cwd},
 		Stdout: os.Stdout,
 		Stderr: os.Stderr,
-		ctx:    ctx,
 	}
 	flagset := flag.NewFlagSet("", flag.ContinueOnError)
 	flagset.IntVar(&jpegIDCmd.NumWorkers, "num-workers", 8, "Number of concurrent workers.")
@@ -118,11 +123,153 @@ func JpegIDCommand(ctx context.Context, args []string) (*JpegIDCmd, error) {
 	if err != nil {
 		return nil, err
 	}
+	handlerOptions := &slog.HandlerOptions{
+		AddSource: true,
+		Level:     slog.LevelError,
+	}
+	if jpegIDCmd.Verbose {
+		handlerOptions.Level = slog.LevelInfo
+	}
+	jpegIDCmd.logger = slog.New(slog.NewTextHandler(jpegIDCmd.Stdout, handlerOptions))
 	return jpegIDCmd, nil
 }
 
-func (jpegIDCmd *JpegIDCmd) Run() error {
+func (jpegIDCmd *JpegIDCmd) Run(ctx context.Context) error {
+	filePaths := make(chan string)
+	for i := 0; i < jpegIDCmd.NumWorkers; i++ {
+		err := jpegIDCmd.startWorker(ctx, filePaths)
+		if err != nil {
+			return err
+		}
+	}
+	for _, root := range jpegIDCmd.Roots {
+		if jpegIDCmd.Recursive {
+			err := fs.WalkDir(os.DirFS(root), ".", func(path string, dirEntry fs.DirEntry, err error) error {
+				jpegIDCmd.logger.Info("walking", slog.String("path", path))
+				if err != nil {
+					return err
+				}
+				if dirEntry.IsDir() {
+					return nil
+				}
+				name := dirEntry.Name()
+				for _, fileRegexp := range jpegIDCmd.FileRegexps {
+					if fileRegexp.MatchString(name) {
+						select {
+						case <-ctx.Done():
+							return ctx.Err()
+						case filePaths <- filepath.Join(root, path):
+							break
+						}
+						return nil
+					}
+				}
+				return nil
+			})
+			if err != nil {
+				return err
+			}
+		} else {
+			jpegIDCmd.logger.Info("readdir", slog.String("root", root))
+			dirEntries, err := fs.ReadDir(os.DirFS(root), ".")
+			if err != nil {
+				return err
+			}
+			for _, dirEntry := range dirEntries {
+				if dirEntry.IsDir() {
+					continue
+				}
+				name := dirEntry.Name()
+				for _, fileRegexp := range jpegIDCmd.FileRegexps {
+					if fileRegexp.MatchString(name) {
+						select {
+						case <-ctx.Done():
+							return nil
+						case filePaths <- filepath.Join(root, name):
+							break
+						}
+					}
+				}
+			}
+		}
+	}
 	return nil
+}
+
+func (jpegIDCmd *JpegIDCmd) startWorker(ctx context.Context, filePaths <-chan string) error {
+	type Exif struct {
+		FileSize           string
+		DateTimeOriginal   string
+		OffsetTimeOriginal string
+	}
+	exifToolCmd := exec.Command("exiftool", "-stay_open", "True", "-@", "-")
+	setpgid(exifToolCmd)
+	exifToolStdin, err := exifToolCmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	exifToolStdout, err := exifToolCmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	exifToolStderr, err := exifToolCmd.StderrPipe()
+	if err != nil {
+		return err
+	}
+	go func() {
+		_, _ = io.Copy(jpegIDCmd.Stderr, exifToolStderr)
+	}()
+	err = exifToolCmd.Start()
+	if err != nil {
+		return fmt.Errorf("starting %s: %w", exifToolCmd.String(), err)
+	}
+	defer func() {
+		_, err := io.WriteString(exifToolStdin, "-stay_open\n"+
+			"False\n")
+		if err != nil {
+			jpegIDCmd.logger.Warn(err.Error())
+		}
+		stop(exifToolCmd)
+	}()
+	var filePath string
+	var buf bytes.Buffer
+	reader := bufio.NewReader(exifToolStdout)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case filePath = <-filePaths:
+			break
+		}
+		_, err := io.WriteString(exifToolStdin, "-json\n"+
+			filePath+"\n"+
+			"-execute\n")
+		if err != nil {
+			return fmt.Errorf("executing -json for %s: %w", filePath, err)
+		}
+		buf.Reset()
+		for {
+			line, err := reader.ReadBytes('\n')
+			if err != nil {
+				if err == io.EOF {
+					return fmt.Errorf("exiftool returned EOF prematurely")
+				}
+				return fmt.Errorf("exiftool response: %w", err)
+			}
+			if string(line) != "{ready}\n" {
+				buf.Write(line)
+				continue
+			}
+			break
+		}
+		var exifs []Exif
+		err = json.Unmarshal(buf.Bytes(), &exifs)
+		if err != nil {
+			return fmt.Errorf("unmarshaling %s: %w", buf.String(), err)
+		}
+		exif := exifs[0]
+		fmt.Fprintf(jpegIDCmd.Stdout, "%s %s %s %s", filePath, exif.FileSize, exif.DateTimeOriginal, exif.OffsetTimeOriginal)
+	}
 }
 
 func compileRegexp(pattern string) (*regexp.Regexp, error) {
