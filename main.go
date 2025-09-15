@@ -1,59 +1,157 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/fs"
+	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
-	"sync"
+	"strings"
+	"syscall"
 	"time"
+	"unicode/utf8"
 )
 
 // 2006-01-02T15.04.05.JPG
+// 2006-01-02T15_04_05+08.01jjdz28.JPG
+// 2006-01-02T150405.01jjdz28.JPG
+// 01jjdz28.2006-01-02.15-04-05(08).JPG
 
-// TODO: use this instead https://pkg.go.dev/github.com/ncruces/go-exiftool#Server
-
-var timestampFilenamePattern = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}\.\d{2}\.\d{2}((?i)\.jpg|jpeg|png)`)
-
-type ExifTool struct {
-	waitGroup sync.WaitGroup
-	tasks     chan Task
-}
-
-func NewExifTool(numWorkers int) (*ExifTool, error) {
-	if numWorkers < 1 {
-		return nil, fmt.Errorf("numWorkers must at least be 1")
+func main() {
+	userInterrupt := make(chan os.Signal, 1)
+	signal.Notify(userInterrupt, syscall.SIGTERM, syscall.SIGINT)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		<-userInterrupt // Soft interrupt.
+		cancel()
+		<-userInterrupt // Hard interrupt.
+		os.Exit(1)
+	}()
+	jpegIDCmd, err := JpegIDCommand(ctx, os.Args)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return
+		}
+		log.Fatal(err)
 	}
-	return nil, nil
-}
-
-func (exifTool *ExifTool) FetchExif(filePaths []string) ([]Exif, error) {
-	return []Exif{}, nil
-}
-
-func (exifTool *ExifTool) Close() error {
-	// TODO: util_unix.go, util_windows.go: setpgid(cmd), stop(cmd)
-	exifTool.waitGroup.Wait()
-	return nil
-}
-
-type Task struct {
-	done     chan struct{}
-	metadata Exif
+	err = jpegIDCmd.Run()
+	if err != nil {
+		fmt.Println(err)
+		os.Exit(1)
+	}
 }
 
 type Exif struct {
-	FilePath   string
-	FileSize   string
-	CreateDate string
-	OffsetTime string
+	FileSize           string
+	DateTimeOriginal   string
+	OffsetTimeOriginal string
 }
 
-func main() {
+type Task struct {
+	completed chan struct{}
+	filePath  string
+	exif      Exif
+	err       error
+}
+
+// jpegid -root . -file DSC -recursive -verbose -num-workers 8 -dry-run
+
+// TODO: why would I multiplex 4 worker goroutines to 4 persistent stay_open exiftool commands? Just have each worker goroutine spin up its own stay_open exiftool invocation and continually feed data into it, parse the output, and execute the rename in-place. Each worker goroutine never has to return anything, since its output is just the rename (or simply printing the dry run results if -dry-run is enabled). You don't even need a Task struct anymore because you're not returning anything, just feeding a filePath into a channel and continuing.
+
+// 2006-01-02.15-04-05(08).01jjdz28.JPG
+
+type JpegIDCmd struct {
+	Roots       []string
+	FileRegexps []*regexp.Regexp
+	NumWorkers  int
+	Recursive   bool
+	Verbose     bool
+	DryRun      bool
+	ExitOnError bool
+	Stdout      io.Writer
+	Stderr      io.Writer
+	ctx         context.Context
+}
+
+func JpegIDCommand(ctx context.Context, args []string) (*JpegIDCmd, error) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	jpegIDCmd := &JpegIDCmd{
+		Roots:  []string{cwd},
+		Stdout: os.Stdout,
+		Stderr: os.Stderr,
+		ctx:    ctx,
+	}
+	flagset := flag.NewFlagSet("", flag.ContinueOnError)
+	flagset.IntVar(&jpegIDCmd.NumWorkers, "num-workers", 8, "Number of concurrent workers.")
+	flagset.BoolVar(&jpegIDCmd.Recursive, "recursive", false, "Walk the roots recursively.")
+	flagset.BoolVar(&jpegIDCmd.Verbose, "verbose", false, "Verbose output.")
+	flagset.BoolVar(&jpegIDCmd.DryRun, "dry-run", false, "Print rename operations without executing.")
+	flagset.BoolVar(&jpegIDCmd.ExitOnError, "exit-on-error", false, "Exit on any error encountered.")
+	flagset.Func("root", "Specify an additional root directory to watch. Can be repeated.", func(value string) error {
+		root, err := filepath.Abs(value)
+		if err != nil {
+			return err
+		}
+		jpegIDCmd.Roots = append(jpegIDCmd.Roots, root)
+		return nil
+	})
+	flagset.Func("file", "Include file regex. Can be repeated.", func(value string) error {
+		r, err := compileRegexp(value)
+		if err != nil {
+			return err
+		}
+		jpegIDCmd.FileRegexps = append(jpegIDCmd.FileRegexps, r)
+		return nil
+	})
+	err = flagset.Parse(args[1:])
+	if err != nil {
+		return nil, err
+	}
+	return jpegIDCmd, nil
+}
+
+func (jpegIDCmd *JpegIDCmd) Run() error {
+	return nil
+}
+
+func compileRegexp(pattern string) (*regexp.Regexp, error) {
+	n := strings.Count(pattern, ".")
+	if n == 0 {
+		return regexp.Compile(pattern)
+	}
+	if strings.HasPrefix(pattern, "./") && len(pattern) > 2 {
+		pattern = pattern[2:]
+	}
+	var b strings.Builder
+	b.Grow(len(pattern) + n)
+	j := 0
+	for j < len(pattern) {
+		prev, _ := utf8.DecodeLastRuneInString(b.String())
+		curr, width := utf8.DecodeRuneInString(pattern[j:])
+		next, _ := utf8.DecodeRuneInString(pattern[j+width:])
+		j += width
+		if prev != '\\' && curr == '.' && (('a' <= next && next <= 'z') || ('A' <= next && next <= 'Z')) {
+			b.WriteString("\\.")
+		} else {
+			b.WriteRune(curr)
+		}
+	}
+	return regexp.Compile(b.String())
+}
+
+func main_Old() {
+	var timestampFilenamePattern = regexp.MustCompile(`\d{4}-\d{2}-\d{2}T\d{2}\.\d{2}\.\d{2}((?i)\.jpg|jpeg|png)`)
 	err := func() error {
 		var dryRun bool
 		flagset := flag.NewFlagSet("jpegid", flag.ContinueOnError)
