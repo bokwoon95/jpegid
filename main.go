@@ -20,13 +20,9 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unicode/utf8"
 )
-
-// 2006-01-02T15.04.05.JPG
-// 2006-01-02T15_04_05+08.01jjdz28.JPG
-// 2006-01-02T150405.01jjdz28.JPG
-// 01jjdz28.2006-01-02.15-04-05(08).JPG
 
 func main() {
 	userInterrupt := make(chan os.Signal, 1)
@@ -48,18 +44,12 @@ func main() {
 	}
 	err = cmd.Run(ctx)
 	if err != nil {
-		if !errors.Is(err, context.Canceled) {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 			fmt.Println(err)
 			os.Exit(1)
 		}
 	}
 }
-
-// jpegid -root . -file DSC -recursive -verbose -num-workers 8 -dry-run
-
-// TODO: why would I multiplex 4 worker goroutines to 4 persistent stay_open exiftool commands? Just have each worker goroutine spin up its own stay_open exiftool invocation and continually feed data into it, parse the output, and execute the rename in-place. Each worker goroutine never has to return anything, since its output is just the rename (or simply printing the dry run results if -dry-run is enabled). You don't even need a Task struct anymore because you're not returning anything, just feeding a filePath into a channel and continuing.
-
-// 2006-01-02.15-04-05(08).01jjdz28.JPG
 
 type JpegIDCmd struct {
 	Roots       []string
@@ -138,11 +128,9 @@ func JpegIDCommand(args []string) (*JpegIDCmd, error) {
 
 func (jpegidCmd *JpegIDCmd) Run(ctx context.Context) error {
 	type Exif struct {
-		FileSize           string
-		DateTimeOriginal   string
-		OffsetTimeOriginal string
+		FileSize               string
+		SubSecDateTimeOriginal string
 	}
-	jpegidCmd.logger.Info("running", slog.String("whee", "gee"))
 	var waitGroup sync.WaitGroup
 	defer waitGroup.Wait()
 	ctx, cancel := context.WithCancel(ctx)
@@ -193,7 +181,7 @@ func (jpegidCmd *JpegIDCmd) Run(ctx context.Context) error {
 						"-execute\n")
 					if err != nil {
 						jpegidCmd.logger.Error(err.Error(), slog.String("filePath", filePath))
-						return
+						break
 					}
 					buf.Reset()
 					for {
@@ -216,61 +204,50 @@ func (jpegidCmd *JpegIDCmd) Run(ctx context.Context) error {
 					err = json.Unmarshal(buf.Bytes(), &exifs)
 					if err != nil {
 						jpegidCmd.logger.Error(err.Error(), slog.String("data", buf.String()))
-						return
+						break
 					}
 					exif := exifs[0]
-					fmt.Fprintf(jpegidCmd.Stdout, "%s %s %s %s\n", filePath, exif.FileSize, exif.DateTimeOriginal, exif.OffsetTimeOriginal)
+					creationTime, err := time.ParseInLocation("2006:01:02 15:04:05.000-07:00", exif.SubSecDateTimeOriginal, time.UTC)
+					if err != nil {
+						jpegidCmd.logger.Error(err.Error(), slog.String("SubSecDateTimeOriginal", exif.SubSecDateTimeOriginal))
+						break
+					}
+					if jpegidCmd.DryRun {
+						fmt.Fprintf(jpegidCmd.Stdout, "%s => %s%s\n", filePath, creationTime.Format("2006-01-02T150405.000-0700"), filepath.Ext(filePath))
+						break
+					}
+					fmt.Fprintf(jpegidCmd.Stdout, "%s => %s%s\n", filePath, creationTime.Format("2006-01-02T150405.000-0700"), filepath.Ext(filePath))
 				}
 			}
 		}()
 	}
 	for _, root := range jpegidCmd.Roots {
-		if jpegidCmd.Recursive {
-			err := fs.WalkDir(os.DirFS(root), ".", func(path string, dirEntry fs.DirEntry, err error) error {
-				if err != nil {
-					return err
-				}
-				if dirEntry.IsDir() {
-					return nil
-				}
-				name := dirEntry.Name()
-				for _, fileRegexp := range jpegidCmd.FileRegexps {
-					if fileRegexp.MatchString(name) {
-						select {
-						case <-ctx.Done():
-							return ctx.Err()
-						case filePaths <- filepath.Join(root, path):
-							break
-						}
-						return nil
-					}
+		err := fs.WalkDir(os.DirFS(root), ".", func(path string, dirEntry fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if dirEntry.IsDir() {
+				if path != "." && !jpegidCmd.Recursive {
+					return fs.SkipDir
 				}
 				return nil
-			})
-			if err != nil {
-				return err
 			}
-		} else {
-			dirEntries, err := fs.ReadDir(os.DirFS(root), ".")
-			if err != nil {
-				return err
-			}
-			for _, dirEntry := range dirEntries {
-				if dirEntry.IsDir() {
-					continue
-				}
-				name := dirEntry.Name()
-				for _, fileRegexp := range jpegidCmd.FileRegexps {
-					if fileRegexp.MatchString(name) {
-						select {
-						case <-ctx.Done():
-							return nil
-						case filePaths <- filepath.Join(root, name):
-							break
-						}
+			name := dirEntry.Name()
+			for _, fileRegexp := range jpegidCmd.FileRegexps {
+				if fileRegexp.MatchString(name) {
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case filePaths <- filepath.Join(root, path):
+						break
 					}
+					return nil
 				}
 			}
+			return nil
+		})
+		if err != nil {
+			return err
 		}
 	}
 	return nil
