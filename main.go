@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"log"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -130,6 +131,8 @@ func (jpegidCmd *JpegIDCmd) Run(ctx context.Context) error {
 	type Exif struct {
 		FileSize               string
 		SubSecDateTimeOriginal string
+		CreateDate             string
+		TimeZone               string
 	}
 	var waitGroup sync.WaitGroup
 	defer waitGroup.Wait()
@@ -208,14 +211,31 @@ func (jpegidCmd *JpegIDCmd) Run(ctx context.Context) error {
 						break
 					}
 					exif := exifs[0]
-					creationTime, err := time.ParseInLocation("2006:01:02 15:04:05.000-07:00", exif.SubSecDateTimeOriginal, time.UTC)
-					if err != nil {
-						logger.Error(err.Error(), slog.String("SubSecDateTimeOriginal", exif.SubSecDateTimeOriginal))
+					var creationTime time.Time
+					if exif.SubSecDateTimeOriginal != "" {
+						creationTime, err = time.ParseInLocation("2006:01:02 15:04:05.000-07:00", exif.SubSecDateTimeOriginal, time.UTC)
+						if err != nil {
+							logger.Error(err.Error(), slog.String("SubSecDateTimeOriginal", exif.SubSecDateTimeOriginal))
+							break
+						}
+					} else if exif.CreateDate != "" {
+						creationTime, err = time.ParseInLocation("2006:01:02 15:04:05-07:00", exif.CreateDate+exif.TimeZone, time.UTC)
+						if err != nil {
+							logger.Error(err.Error(), slog.String("SubSecDateTimeOriginal", exif.SubSecDateTimeOriginal))
+							break
+						}
+						creationTime = creationTime.Add(time.Duration(rand.IntN(1000)) * time.Millisecond)
+					} else {
+						logger.Error("unable to fetch file creation time", slog.String("data", buf.String()))
 						break
 					}
 					newFilePath := creationTime.Format("2006-01-02T150405.000-0700") + filepath.Ext(filePath)
 					if jpegidCmd.DryRun {
-						fmt.Fprintf(jpegidCmd.Stdout, "%s => %s\n", filePath, newFilePath)
+						b, err := json.Marshal(exif)
+						if err != nil {
+							logger.Warn(err.Error())
+						}
+						fmt.Fprintf(jpegidCmd.Stdout, "%s => %s %s\n", filePath, newFilePath, string(b))
 						break
 					}
 					if jpegidCmd.ReplaceIfExists {
