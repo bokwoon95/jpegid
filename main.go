@@ -52,16 +52,16 @@ func main() {
 }
 
 type JpegIDCmd struct {
-	Roots       []string
-	FileRegexps []*regexp.Regexp
-	NumWorkers  int
-	Recursive   bool
-	Verbose     bool
-	DryRun      bool
-	ExitOnError bool
-	Stdout      io.Writer
-	Stderr      io.Writer
-	logger      *slog.Logger
+	Roots           []string
+	FileRegexps     []*regexp.Regexp
+	NumWorkers      int
+	Recursive       bool
+	Verbose         bool
+	DryRun          bool
+	ReplaceIfExists bool
+	Stdout          io.Writer
+	Stderr          io.Writer
+	logger          *slog.Logger
 }
 
 func JpegIDCommand(args []string) (*JpegIDCmd, error) {
@@ -79,7 +79,7 @@ func JpegIDCommand(args []string) (*JpegIDCmd, error) {
 	flagset.BoolVar(&jpegidCmd.Recursive, "recursive", false, "Walk the roots recursively.")
 	flagset.BoolVar(&jpegidCmd.Verbose, "verbose", false, "Verbose output.")
 	flagset.BoolVar(&jpegidCmd.DryRun, "dry-run", false, "Print rename operations without executing.")
-	flagset.BoolVar(&jpegidCmd.ExitOnError, "exit-on-error", false, "Exit on any error encountered.")
+	flagset.BoolVar(&jpegidCmd.ReplaceIfExists, "replace-if-exists", false, "If a file with the new name already exists, replace it.")
 	flagset.Func("root", "Specify an additional root directory to watch. Can be repeated.", func(value string) error {
 		root, err := filepath.Abs(value)
 		if err != nil {
@@ -156,7 +156,7 @@ func (jpegidCmd *JpegIDCmd) Run(ctx context.Context) error {
 		}()
 		err = exifToolCmd.Start()
 		if err != nil {
-			return fmt.Errorf("starting %s: %w", exifToolCmd.String(), err)
+			return fmt.Errorf("%s: %w", exifToolCmd.String(), err)
 		}
 		waitGroup.Add(1)
 		go func() {
@@ -212,11 +212,35 @@ func (jpegidCmd *JpegIDCmd) Run(ctx context.Context) error {
 						jpegidCmd.logger.Error(err.Error(), slog.String("SubSecDateTimeOriginal", exif.SubSecDateTimeOriginal))
 						break
 					}
+					newFilePath := creationTime.Format("2006-01-02T150405.000-0700") + filepath.Ext(filePath)
 					if jpegidCmd.DryRun {
-						fmt.Fprintf(jpegidCmd.Stdout, "%s => %s%s\n", filePath, creationTime.Format("2006-01-02T150405.000-0700"), filepath.Ext(filePath))
+						fmt.Fprintf(jpegidCmd.Stdout, "%s => %s\n", filePath, newFilePath)
 						break
 					}
-					fmt.Fprintf(jpegidCmd.Stdout, "%s => %s%s\n", filePath, creationTime.Format("2006-01-02T150405.000-0700"), filepath.Ext(filePath))
+					if jpegidCmd.ReplaceIfExists {
+						err := os.Rename(filePath, newFilePath)
+						if err != nil {
+							jpegidCmd.logger.Error(err.Error(), slog.String("old", filePath), slog.String("new", newFilePath))
+							break
+						}
+						jpegidCmd.logger.Info("renamed file", slog.String("old", filePath), slog.String("new", newFilePath))
+						break
+					}
+					_, err = os.Stat(newFilePath)
+					if err != nil {
+						if !errors.Is(err, fs.ErrNotExist) {
+							jpegidCmd.logger.Error(err.Error(), slog.String("name", newFilePath))
+							break
+						}
+						err := os.Rename(filePath, newFilePath)
+						if err != nil {
+							jpegidCmd.logger.Error(err.Error(), slog.String("old", filePath), slog.String("new", newFilePath))
+							break
+						}
+						jpegidCmd.logger.Info("renamed file", slog.String("old", filePath), slog.String("new", newFilePath))
+					} else {
+						jpegidCmd.logger.Info("file already exists, skipping (use -replace-if-exists to replace it)", slog.String("name", newFilePath))
+					}
 				}
 			}
 		}()
