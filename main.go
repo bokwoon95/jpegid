@@ -229,7 +229,7 @@ func (jpegidCmd *JpegIDCmd) Run(ctx context.Context) error {
 						logger.Error("unable to fetch file creation time", slog.String("data", buf.String()))
 						break
 					}
-					newFilePath := creationTime.Format("2006-01-02T150405.000-0700") + filepath.Ext(filePath)
+					newFilePath := filepath.Join(filepath.Dir(filePath), creationTime.Format("2006-01-02T150405.000-0700") + filepath.Ext(filePath))
 					if jpegidCmd.DryRun {
 						b, err := json.Marshal(exif)
 						if err != nil {
