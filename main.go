@@ -176,11 +176,12 @@ func (jpegidCmd *JpegIDCmd) Run(ctx context.Context) error {
 				case <-ctx.Done():
 					return
 				case filePath := <-filePaths:
+					logger := jpegidCmd.logger.With(slog.String("filePath", filePath))
 					_, err := io.WriteString(exifToolStdin, "-json\n"+
 						filePath+"\n"+
 						"-execute\n")
 					if err != nil {
-						jpegidCmd.logger.Error(err.Error(), slog.String("filePath", filePath))
+						logger.Error(err.Error())
 						break
 					}
 					buf.Reset()
@@ -188,10 +189,10 @@ func (jpegidCmd *JpegIDCmd) Run(ctx context.Context) error {
 						line, err := reader.ReadBytes('\n')
 						if err != nil {
 							if err == io.EOF {
-								jpegidCmd.logger.Error("exiftool returned EOF prematurely")
+								logger.Error("exiftool returned EOF prematurely")
 								return
 							}
-							jpegidCmd.logger.Error(err.Error())
+							logger.Error(err.Error())
 							return
 						}
 						if string(line) != "{ready}\n" {
@@ -209,7 +210,7 @@ func (jpegidCmd *JpegIDCmd) Run(ctx context.Context) error {
 					exif := exifs[0]
 					creationTime, err := time.ParseInLocation("2006:01:02 15:04:05.000-07:00", exif.SubSecDateTimeOriginal, time.UTC)
 					if err != nil {
-						jpegidCmd.logger.Error(err.Error(), slog.String("SubSecDateTimeOriginal", exif.SubSecDateTimeOriginal))
+						logger.Error(err.Error(), slog.String("SubSecDateTimeOriginal", exif.SubSecDateTimeOriginal))
 						break
 					}
 					newFilePath := creationTime.Format("2006-01-02T150405.000-0700") + filepath.Ext(filePath)
@@ -220,10 +221,10 @@ func (jpegidCmd *JpegIDCmd) Run(ctx context.Context) error {
 					if jpegidCmd.ReplaceIfExists {
 						err := os.Rename(filePath, newFilePath)
 						if err != nil {
-							jpegidCmd.logger.Error(err.Error(), slog.String("old", filePath), slog.String("new", newFilePath))
+							logger.Error(err.Error(), slog.String("newFilePath", newFilePath))
 							break
 						}
-						jpegidCmd.logger.Info("renamed file", slog.String("old", filePath), slog.String("new", newFilePath))
+						logger.Info("renamed file", slog.String("newFilePath", newFilePath))
 						break
 					}
 					_, err = os.Stat(newFilePath)
@@ -234,12 +235,12 @@ func (jpegidCmd *JpegIDCmd) Run(ctx context.Context) error {
 						}
 						err := os.Rename(filePath, newFilePath)
 						if err != nil {
-							jpegidCmd.logger.Error(err.Error(), slog.String("old", filePath), slog.String("new", newFilePath))
+							logger.Error(err.Error(), slog.String("newFilePath", newFilePath))
 							break
 						}
-						jpegidCmd.logger.Info("renamed file", slog.String("old", filePath), slog.String("new", newFilePath))
+						logger.Info("renamed file", slog.String("newFilePath", newFilePath))
 					} else {
-						jpegidCmd.logger.Info("file already exists, skipping (use -replace-if-exists to replace it)", slog.String("name", newFilePath))
+						logger.Info("file already exists, skipping (use -replace-if-exists to replace it)", slog.String("newFilePath", newFilePath))
 					}
 				}
 			}
